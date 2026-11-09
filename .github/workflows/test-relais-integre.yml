@@ -1,0 +1,264 @@
+name: Test intégré Claude Code et relais fictif
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/test-relais-integre.yml]
+permissions: {}
+jobs:
+  mock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Tester Claude Code sans réseau externe ni identifiant réel
+        run: |
+          set -eu
+          cat > Dockerfile <<'DOCKER'
+          FROM node:24-bookworm
+          RUN apt-get update && apt-get install -y --no-install-recommends python3 && npm install -g @anthropic-ai/claude-code@2.1.311
+          COPY mock.py relay.py /
+          DOCKER
+          cat > mock.py <<'PYTHON'
+          import http.client
+          import json
+          from relay import Handler, Relay
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          import threading
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          
+          MODEL = "claude-haiku-4-5-20251001"
+          PROMPT = (
+              "Corrige uniquement la faute d’accord dans la phrase suivante. "
+              "Renvoie uniquement la phrase corrigée, sans utiliser d’outil.\n\n"
+              "Les documents fictifs est prêts."
+          )
+          ANSWER = "Les documents fictifs sont prêts."
+          TOKEN = "jeton-fictif-du-relais"
+          requests_seen = []
+          
+          
+          class MockAnthropic(BaseHTTPRequestHandler):
+              def log_message(self, *_):
+                  pass
+          
+              def do_POST(self):
+                  if self.path.split("?", 1)[0] != "/v1/messages":
+                      self.send_error(404)
+                      return
+                  if self.headers.get("Authorization") != f"Bearer {TOKEN}":
+                      self.send_error(403)
+                      return
+                  size = int(self.headers.get("Content-Length", "0"))
+                  if not 0 < size <= 100_000:
+                      self.send_error(413)
+                      return
+                  data = json.loads(self.rfile.read(size))
+                  if data.get("model") != MODEL or PROMPT not in json.dumps(
+                      data.get("messages"), ensure_ascii=False
+                  ).replace("\\n", "\n") or data.get("tools"):
+                      self.send_error(403)
+                      return
+                  if requests_seen:
+                      self.send_error(409)
+                      return
+                  requests_seen.append(True)
+                  message = {
+                      "id": "msg_mock", "type": "message", "role": "assistant",
+                      "model": MODEL, "content": [], "stop_reason": None,
+                      "stop_sequence": None, "usage": {"input_tokens": 42, "output_tokens": 0},
+                  }
+                  if data.get("stream"):
+                      events = [
+                          ("message_start", {"message": message}),
+                          ("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}}),
+                          ("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": ANSWER}}),
+                          ("content_block_stop", {"index": 0}),
+                          ("message_delta", {"delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                             "usage": {"output_tokens": 8}}),
+                          ("message_stop", {}),
+                      ]
+                      self.send_response(200)
+                      self.send_header("Content-Type", "text/event-stream")
+                      self.end_headers()
+                      for name, fields in events:
+                          self.wfile.write(f"event: {name}\ndata: {json.dumps({'type': name, **fields})}\n\n".encode())
+                  else:
+                      message["content"] = [{"type": "text", "text": ANSWER}]
+                      message["stop_reason"] = "end_turn"
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.end_headers()
+                      self.wfile.write(json.dumps(message).encode())
+          
+          
+          def main():
+              cli = os.environ.get("TEST_CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
+              with tempfile.TemporaryDirectory(prefix="test-claude-fictif-") as temp:
+                  with HTTPServer(("127.0.0.1", 0), MockAnthropic) as upstream, Relay(("127.0.0.1", 0), Handler) as server:
+                      def forward(body, _headers):
+                          connection = http.client.HTTPConnection("127.0.0.1", upstream.server_port, timeout=5)
+                          try:
+                              connection.request("POST", "/v1/messages", body, {"Authorization": "Bearer " + TOKEN})
+                              response = connection.getresponse()
+                              return response.status, response.getheader("Content-Type"), response.read()
+                          finally:
+                              connection.close()
+                      server.forward = forward
+                      threading.Thread(target=upstream.serve_forever, daemon=True).start()
+                      thread = threading.Thread(target=server.serve_forever, daemon=True)
+                      thread.start()
+                      env = {
+                          "PATH": "/usr/bin:/bin",
+                          "HOME": temp,
+                          "TMPDIR": temp,
+                          "CLAUDE_CONFIG_DIR": temp,
+                          "CLAUDE_CODE_OAUTH_TOKEN": "faux-identifiant-client",
+                          "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{server.server_port}",
+                          "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                          "DISABLE_AUTOUPDATER": "1",
+                      }
+                      try:
+                          result = subprocess.run(
+                              [cli, "-p", "--model", MODEL, "--max-turns", "1", "--tools", "",
+                               "--strict-mcp-config", "--no-session-persistence", PROMPT],
+                              cwd=temp, env=env, capture_output=True, text=True, timeout=45,
+                          )
+                          if result.returncode or len(requests_seen) != 1 or result.stdout.strip() != ANSWER:
+                              raise SystemExit(f"ÉCHEC du test simulé (code {result.returncode}, requêtes acceptées {len(requests_seen)})")
+                          from contextlib import closing
+                          with closing(http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)) as connection:
+                              connection.request("POST", "/v1/messages", b"{}")
+                              assert connection.getresponse().status == 409
+                          assert len(requests_seen) == 1
+                          print("TEST INTÉGRÉ CLAUDE CODE ET RELAIS RÉUSSI")
+                      finally:
+                          server.shutdown()
+          
+          
+          if __name__ == "__main__":
+              main()
+          PYTHON
+          cat > relay.py <<'RELAY'
+          """Relais du seul essai fictif. Le jeton doit être fourni au relais seul."""
+          
+          import http.client
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          import json
+          import os
+          import ssl
+          
+          MODEL = "claude-haiku-4-5-20251001"
+          PROMPT = (
+              "Corrige uniquement la faute d’accord dans la phrase suivante. "
+              "Renvoie uniquement la phrase corrigée, sans utiliser d’outil.\n\n"
+              "Les documents fictifs est prêts."
+          )
+          MAX_BODY = 100_000
+          MAX_RESPONSE = 256_000
+          
+          
+          def approved(body):
+              try:
+                  payload = json.loads(body)
+                  messages = payload["messages"]
+                  if len(messages) != 1 or messages[0]["role"] != "user":
+                      return False
+                  content = messages[0]["content"]
+                  if isinstance(content, list):
+                      if len(content) != 1 or content[0].get("type") != "text":
+                          return False
+                      content = content[0]["text"]
+                  return payload["model"] == MODEL and content == PROMPT and not payload.get("tools")
+              except (ValueError, TypeError, KeyError, AttributeError, IndexError):
+                  return False
+          
+          
+          class Relay(HTTPServer):
+              used = False
+          
+          
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, *_):
+                  pass
+          
+              def do_POST(self):
+                  if self.path not in ("/v1/messages", "/v1/messages?beta=true"):
+                      self.send_error(403)
+                      return
+                  if self.server.used:
+                      self.send_error(409)
+                      return
+                  self.connection.settimeout(5)
+                  try:
+                      size = int(self.headers.get("Content-Length", "0"))
+                      if not 0 < size <= MAX_BODY:
+                          self.send_error(413)
+                          return
+                      body = self.rfile.read(size)
+                  except (OSError, ValueError):
+                      self.send_error(400)
+                      return
+                  if not approved(body):
+                      self.send_error(403)
+                      return
+          
+                  # HTTPServer handles requests serially. Reserve the only call before
+                  # contacting the upstream, even if it times out or returns an error.
+                  self.server.used = True
+                  try:
+                      status, content_type, response = self.server.forward(body, self.headers)
+                  except (OSError, http.client.HTTPException):
+                      self.send_error(502)
+                      return
+                  if status != 200 or content_type not in ("application/json", "text/event-stream"):
+                      self.send_error(502)
+                      return
+                  self.send_response(200)
+                  self.send_header("Content-Type", content_type)
+                  self.send_header("Content-Length", str(len(response)))
+                  self.end_headers()
+                  self.wfile.write(response)
+          
+              def do_CONNECT(self):
+                  self.send_error(403)
+          
+          
+          def forward_to_anthropic(token, body, client_headers):
+              headers = {
+                  "Authorization": "Bearer " + token,
+                  "Content-Type": "application/json",
+                  "anthropic-version": "2023-06-01",
+              }
+              if client_headers.get("anthropic-beta"):
+                  headers["anthropic-beta"] = client_headers["anthropic-beta"]
+              connection = http.client.HTTPSConnection(
+                  "api.anthropic.com", 443, timeout=20, context=ssl.create_default_context()
+              )
+              try:
+                  connection.request("POST", "/v1/messages?beta=true", body, headers)
+                  response = connection.getresponse()
+                  data = response.read(MAX_RESPONSE + 1)
+                  if len(data) > MAX_RESPONSE:
+                      raise OSError("Response too large")
+                  kind = response.getheader("Content-Type", "").split(";", 1)[0]
+                  return response.status, kind, data
+              finally:
+                  connection.close()
+          
+          
+          def main():
+              token = os.environ.pop("PILOT_RELAY_OAUTH_TOKEN", "")
+              if not token:
+                  raise SystemExit("Le jeton du relais est absent.")
+              with Relay(("0.0.0.0", 8080), Handler) as server:
+                  server.forward = lambda body, headers: forward_to_anthropic(token, body, headers)
+                  server.serve_forever()
+          
+          
+          if __name__ == "__main__":
+              main()
+          RELAY
+          docker build -t claude-mock .
+          docker run --rm --network none --cap-drop ALL --user 1000:1000 -e TEST_CLAUDE_BIN=/usr/local/bin/claude claude-mock python3 /mock.py
