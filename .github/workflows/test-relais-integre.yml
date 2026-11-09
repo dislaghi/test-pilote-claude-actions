@@ -201,6 +201,8 @@ jobs:
                       self.send_error(400)
                       return
                   if not approved(body):
+                      payload = json.loads(body)
+                      print("Shape", payload.get("model"), sorted(payload), [(m.get("role"), [(b.get("type"), len(b.get("text", "")), b.get("text", "") == PROMPT, b.get("text", "").startswith("<system-reminder>")) for b in m.get("content", [])] if isinstance(m.get("content"), list) else m.get("content") == PROMPT) for m in payload.get("messages", [])], flush=True)
                       self.send_error(403)
                       return
           
