@@ -1,0 +1,140 @@
+name: Test fictif HTTPS et DNS
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/test-relais-https-dns.yml]
+permissions: {}
+jobs:
+  network-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Tester le relais et les réseaux fictifs
+        shell: bash
+        run: |
+          #!/bin/bash
+          set -euo pipefail
+          image=python:3.12-alpine
+          docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
+          scratch=$(mktemp -d)
+          scratch=$(cd "$scratch" && pwd -P)
+          id="filtrage-pilote-$(date +%s)-$$"
+          front="$id-front"
+          back="$id-back"
+          allowed="$id-autorise"
+          denied="$id-interdit"
+          relay="$id-relais"
+          
+          cleanup() {
+            docker rm -f "$relay" "$allowed" "$denied" >/dev/null 2>&1 || true
+            docker network rm "$front" "$back" >/dev/null 2>&1 || true
+            rm -f "$scratch/cert.pem" "$scratch/key.pem"
+            rmdir "$scratch"
+          }
+          trap cleanup EXIT
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj "/CN=$allowed" -addext "subjectAltName=DNS:$allowed" \
+            -keyout "$scratch/key.pem" -out "$scratch/cert.pem" 2>/dev/null
+          docker network create --internal "$front" >/dev/null
+          docker network create --internal "$back" >/dev/null
+          
+          serve='import ssl, sys
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200)
+                  self.end_headers()
+                  self.wfile.write(sys.argv[1].encode())
+          server = HTTPServer(("0.0.0.0", 8080), Handler)
+          tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          tls.load_cert_chain("/tls/cert.pem", "/tls/key.pem")
+          server.socket = tls.wrap_socket(server.socket, server_side=True)
+          server.serve_forever()'
+          for target in "$allowed" "$denied"; do
+            docker run --pull=never -d --name "$target" --network "$back" -v "$scratch:/tls:ro" "$image" \
+              python -c "$serve" "$target" >/dev/null
+          done
+          
+          forward='import ssl, sys, urllib.request
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          class Handler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path != "/" or self.headers.get("Host") != sys.argv[2] + ":8080":
+                      self.send_error(403)
+                      return
+                  with urllib.request.urlopen("https://" + sys.argv[1] + ":8080/", timeout=2, context=ssl.create_default_context(cafile="/cert.pem")) as upstream:
+                      self.send_response(200)
+                      self.end_headers()
+                      self.wfile.write(upstream.read())
+              def do_CONNECT(self):
+                  self.send_error(403)
+          HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()'
+          docker create --pull=never --name "$relay" --network "$front" -v "$scratch/cert.pem:/cert.pem:ro" "$image" \
+            python -c "$forward" "$allowed" "$relay" >/dev/null
+          docker network connect "$back" "$relay"
+          docker start "$relay" >/dev/null
+          ip() { docker inspect --format "{{(index .NetworkSettings.Networks \"$back\").IPAddress}}" "$1"; }
+          probe='import http.client, socket, ssl, sys, time
+          mode, allowed_ip, denied_ip, relay, expected, denied = sys.argv[1:]
+          def request(host, method="GET", path="/"):
+              conn = http.client.HTTPConnection(host, 8080, timeout=2)
+              try:
+                  conn.request(method, path)
+                  result = conn.getresponse()
+                  return result.status, result.read()
+              finally:
+                  conn.close()
+          def check(test, label):
+              if not test:
+                  sys.exit("ÉCHEC : " + label)
+              print("OK : " + label)
+          def wait_request(host):
+              for _ in range(15):
+                  try:
+                      return request(host)
+                  except OSError:
+                      time.sleep(1)
+              sys.exit("ÉCHEC : serveur témoin indisponible")
+          if mode == "controle":
+              for name, address in ((expected, allowed_ip), (denied, denied_ip)):
+                  check(socket.gethostbyname(name) == address, "nom témoin résolu dans le réseau de contrôle")
+                  for attempt in range(15):
+                      try:
+                          connection = socket.create_connection((address, 8080), timeout=2)
+                          break
+                      except OSError:
+                          if attempt == 14:
+                              raise
+                          time.sleep(1)
+                  with connection:
+                      context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                      context.check_hostname = False
+                      context.verify_mode = ssl.CERT_NONE
+                      with context.wrap_socket(connection):
+                          pass
+                  check(True, "connexion TLS possible dans le réseau de contrôle")
+          else:
+              for name in (expected, denied):
+                  try:
+                      socket.gethostbyname(name)
+                  except socket.gaierror:
+                      print("OK : nom privé inaccessible depuis le réseau isolé")
+                  else:
+                      sys.exit("ÉCHEC : résolution du nom privé")
+              check(wait_request(relay) == (200, expected.encode()), "destination autorisée via le relais")
+              check(request(relay, "CONNECT", denied_ip + ":8080")[0] == 403, "tunnel vers une autre destination refusé")
+              check(request(relay, "GET", "http://" + denied_ip + ":8080/")[0] == 403, "adresse alternative refusée")
+              for host in (allowed_ip, denied_ip):
+                  try:
+                      with socket.create_connection((host, 8080), timeout=2):
+                          connected = True
+                  except OSError:
+                      connected = False
+                  check(not connected, "connexion directe bloquée")'
+          for mode in controle isole; do
+            network="$front"
+            if [[ "$mode" == controle ]]; then network="$back"; fi
+            docker run --pull=never --rm --network "$network" --dns 127.0.0.1 --cap-drop ALL "$image" \
+              python -c "$probe" "$mode" "$(ip "$allowed")" "$(ip "$denied")" "$relay" "$allowed" "$denied"
+          done
+          printf 'TEST RÉSEAU RÉUSSI\n'
