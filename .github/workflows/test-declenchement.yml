@@ -1,0 +1,21 @@
+name: Test fictif du déclenchement du pilote
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: claude-code-pilot-test
+  cancel-in-progress: false
+jobs:
+  preflight:
+    if: >-
+      github.repository == 'dislaghi/test-pilote-claude-actions' &&
+      github.ref == 'refs/heads/main' &&
+      github.actor == 'dislaghi' &&
+      github.triggering_actor == 'dislaghi' &&
+      github.run_attempt == '1' &&
+      vars.CLAUDE_PILOT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Confirmer le passage du contrôle
+        run: echo 'Contrôle franchi. Aucun appel à Claude.'
